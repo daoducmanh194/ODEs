@@ -163,3 +163,92 @@ def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options
         return _interp_evaluate(coef, t0, t1, t_eval)
 
     return dense_output_fn
+
+
+def odeint_event(func, y0, t0, *, event_fn, reverse_time=False, odeint_interface=odeint, **kwargs):
+    """
+    Automatically links up the gradient from the event time.
+    """
+    if reverse_time:
+        t = torch.cat([t0.reshape(-1), t0.reshape(-1).detach() - 1.0])
+    else:
+        t = torch.cat([t0.reshape(-1), t0.reshape(-1).detach() + 1.0])
+
+    event_t, solution = odeint_interface(func, y0, t, event_fn=event_fn, **kwargs)
+
+    # Dummy values for rtol, atol, method, and options.
+    shapes, _func, _, t, _, _, _, _, event_fn, _ = _check_inputs(func, y0, t, 0.0, 0.0, None, None, event_fn, SOLVERS)
+
+    if shapes is not None:
+        state_t = torch.cat([s[-1].reshape(-1) for s in solution])
+    else:
+        state_t = solution[-1]
+
+    # Event_fn takes in negated time value if reverse_time is True.
+    if reverse_time:
+        event_t = -event_t
+
+    event_t, state_t = ImplicitFnGradientRerouting.apply(_func, event_fn, event_t, state_t)
+
+    # Return the user expected time value.
+    if reverse_time:
+        event_t = -event_t
+
+    if shapes is not None:
+        state_t = _flat_to_shape(state_t, (), shapes)
+        solution = tuple(torch.cat([s[:-1], s_t[None]], dim=0) for s, s_t in zip(solution, state_t))
+    else:
+        solution = torch.cat([solution[:-1], state_t[None]], dim=0)
+
+    return event_t, solution
+
+
+class ImplicitFnGradientRerouting(torch.autograd.Function):
+    
+    @staticmethod
+    def forward(ctx, func, event_fn, event_t, state_t):
+        """
+        A static method to perform the forward pass of the function, saving the necessary context for backward pass.
+        Parameters:
+            ctx: context for the function
+            func: the function to be operated on
+            event_fn: the event function
+            event_t: the event solution
+            state_t: the state solution
+        Returns:
+            A tuple containing the detached event solution and state solution
+        """
+        # """ event_t is the solution for event_fn """
+        ctx.func = func
+        ctx.event_fn = event_fn
+        ctx.save_for_backward(event_t, state_t)
+        return event_t.detach(), state_t.detach()
+    
+    @staticmethod
+    def backward(ctx, grad_t, grad_state):
+        """
+        Calculate the backward pass for the given context, gradient with respect to time, and gradient of the internal state. 
+        """
+        func = ctx.func
+        event_fn = ctx.event_fn
+        event_t, state_t = ctx.saved_tensors
+        
+        event_t = event_t.detach().clone().require_grad_(True)
+        state_t = state_t.detach().clone().require_grad_(True)
+        
+        f_val = func(event_t, state_t)
+        
+        with torch.enable_grad():
+            c, (par_dt, dstate) = vjp(event_fn, (event_t, state_t))
+            
+        # Total derivative of event_fn wrt t evaluated at event_t
+        dcdt = par_dt + torch.sum(dstate * f_val)
+        
+        # Add the gradient from final state to final time value as if a regular odeint was called.
+        grad_t = grad_t + torch.sum(grad_state * f_val)
+        
+        dstate = dstate * (-grad_t / (dcdt + 1e-12)).reshape(c)
+        
+        grad_state = grad_state + dstate
+        
+        return None, None, None, grad_state
