@@ -11,7 +11,6 @@ from .scipy_wrapper import ScipyWrapperODESolver
 from .misc import _check_inputs, _flat_to_shape
 from .interp import _interp_evaluate
 
-
 SOLVERS = {
     'dopri8': Dopri8Solver,
     'dopri5': Dopri5Solver,
@@ -94,20 +93,6 @@ def odeint(func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=None, even
 
 
 def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options=None):
-    """
-    A function to integrate a system of ordinary differential equations.
-    
-    :param func: The system of ordinary differential equations to integrate.
-    :param y0: The initial state of the system.
-    :param t0: The initial time.
-    :param t1: The final time.
-    :param rtol: The relative tolerance for the solver.
-    :param atol: The absolute tolerance for the solver.
-    :param method: The integration method to use (default is None).
-    :param options: Additional options for the solver (default is None).
-    :return: The function for evaluating the solution at any time within the integration interval.
-    :rtype: function
-    """
 
     assert torch.is_tensor(y0)  # TODO: handle tuple of tensors
 
@@ -147,15 +132,6 @@ def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options
     interp_coeffs = torch.stack(interp_coeffs)
 
     def dense_output_fn(t_eval):
-        """
-        Function to perform dense output interpolation at the given evaluation time.
-
-        Parameters:
-            t_eval (torch.Tensor): The time at which interpolation is to be performed.
-
-        Returns:
-            torch.Tensor: The interpolated value at the evaluation time.
-        """
         idx = torch.searchsorted(times, t_eval, side="right")
         t0 = times[idx - 1]
         t1 = times[idx]
@@ -166,9 +142,8 @@ def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options
 
 
 def odeint_event(func, y0, t0, *, event_fn, reverse_time=False, odeint_interface=odeint, **kwargs):
-    """
-    Automatically links up the gradient from the event time.
-    """
+    """Automatically links up the gradient from the event time."""
+
     if reverse_time:
         t = torch.cat([t0.reshape(-1), t0.reshape(-1).detach() - 1.0])
     else:
@@ -204,51 +179,37 @@ def odeint_event(func, y0, t0, *, event_fn, reverse_time=False, odeint_interface
 
 
 class ImplicitFnGradientRerouting(torch.autograd.Function):
-    
+
     @staticmethod
     def forward(ctx, func, event_fn, event_t, state_t):
-        """
-        A static method to perform the forward pass of the function, saving the necessary context for backward pass.
-        Parameters:
-            ctx: context for the function
-            func: the function to be operated on
-            event_fn: the event function
-            event_t: the event solution
-            state_t: the state solution
-        Returns:
-            A tuple containing the detached event solution and state solution
-        """
-        # """ event_t is the solution for event_fn """
+        """ event_t is the solution to event_fn """
         ctx.func = func
         ctx.event_fn = event_fn
         ctx.save_for_backward(event_t, state_t)
         return event_t.detach(), state_t.detach()
-    
+
     @staticmethod
     def backward(ctx, grad_t, grad_state):
-        """
-        Calculate the backward pass for the given context, gradient with respect to time, and gradient of the internal state. 
-        """
         func = ctx.func
         event_fn = ctx.event_fn
         event_t, state_t = ctx.saved_tensors
-        
-        event_t = event_t.detach().clone().require_grad_(True)
-        state_t = state_t.detach().clone().require_grad_(True)
-        
+
+        event_t = event_t.detach().clone().requires_grad_(True)
+        state_t = state_t.detach().clone().requires_grad_(True)
+
         f_val = func(event_t, state_t)
-        
+
         with torch.enable_grad():
             c, (par_dt, dstate) = vjp(event_fn, (event_t, state_t))
-            
-        # Total derivative of event_fn wrt t evaluated at event_t
+
+        # Total derivative of event_fn wrt t evaluated at event_t.
         dcdt = par_dt + torch.sum(dstate * f_val)
-        
+
         # Add the gradient from final state to final time value as if a regular odeint was called.
         grad_t = grad_t + torch.sum(grad_state * f_val)
-        
-        dstate = dstate * (-grad_t / (dcdt + 1e-12)).reshape(c)
-        
+
+        dstate = dstate * (-grad_t / (dcdt + 1e-12)).reshape_as(c)
+
         grad_state = grad_state + dstate
-        
+
         return None, None, None, grad_state
